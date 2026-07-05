@@ -3,6 +3,11 @@ FROM --platform=$BUILDPLATFORM node:18 AS frontend-builder
 WORKDIR /app
 # 复制 excalidraw 子模块
 COPY excalidraw/ ./excalidraw/
+# AI endpoint/model configurability (build-args; unset = upstream defaults preserved)
+ARG VITE_APP_OPENAI_API_URL
+ARG VITE_APP_OPENAI_MODEL
+ENV VITE_APP_OPENAI_API_URL=${VITE_APP_OPENAI_API_URL}
+ENV VITE_APP_OPENAI_MODEL=${VITE_APP_OPENAI_MODEL}
 # 构建前端
 RUN cd excalidraw && npm install -g pnpm && pnpm install && cd excalidraw-app && DISABLE_VITE_CHECKER=true pnpm build:app:docker
 
