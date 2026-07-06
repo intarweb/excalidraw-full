@@ -1,0 +1,197 @@
+diff --git a/excalidraw-app/app-jotai.ts b/excalidraw-app/app-jotai.ts
+index ef5a0897..77847c40 100644
+--- a/excalidraw-app/app-jotai.ts
++++ b/excalidraw-app/app-jotai.ts
+@@ -85,12 +85,16 @@ const STORAGE_CONFIG_SESSION_STORAGE_KEY =
+   "excalidraw-storage-config-credentials";
+ 
+ const getInitialStorageConfig = (): StorageConfig => {
+-  const defaultConfig: StorageConfig = { type: "indexed-db" };
++  // Backend (server-side, OIDC-scoped) storage is the default for this self-hosted
++  // deploy so boards persist cross-browser/device under the user's identity. Users
++  // can still pick indexed-db (local) / kv / s3 in Storage Settings. (Was "indexed-db",
++  // which made boards browser-local → invisible cross-browser.)
++  const defaultConfig: StorageConfig = { type: "default" };
+   try {
+     const _prevConfig = localStorage.getItem(STORAGE_CONFIG_LOCAL_STORAGE_KEY);
+     const defaultConfig: StorageConfig = _prevConfig
+       ? JSON.parse(_prevConfig)
+-      : { type: "indexed-db" };
++      : { type: "default" };
+     const nonSensitive = localStorage.getItem(STORAGE_CONFIG_LOCAL_STORAGE_KEY);
+     const sensitive = sessionStorage.getItem(
+       STORAGE_CONFIG_SESSION_STORAGE_KEY,
+diff --git a/excalidraw-app/hooks/useAuth.ts b/excalidraw-app/hooks/useAuth.ts
+index 59010f48..8bd0d1ca 100644
+--- a/excalidraw-app/hooks/useAuth.ts
++++ b/excalidraw-app/hooks/useAuth.ts
+@@ -3,9 +3,27 @@ import { jwtDecode } from "jwt-decode";
+ 
+ import type { User } from "../app-jotai";
+ 
++const AUTH_REDIRECT_GUARD_KEY = "auth_redirect_attempted";
++
++// Auto-initiate OIDC login when there is no valid session token, so backend API
++// calls (/api/v2/kv) always carry an Authorization: Bearer. Guarded to redirect at
++// most once per browser session (prevents a redirect loop if login can't complete);
++// the guard is cleared on a successful auth so a later token-expiry re-triggers it.
++const redirectToLogin = () => {
++  try {
++    if (sessionStorage.getItem(AUTH_REDIRECT_GUARD_KEY)) {
++      return;
++    }
++    sessionStorage.setItem(AUTH_REDIRECT_GUARD_KEY, "1");
++  } catch {
++    // sessionStorage unavailable — fall through and redirect this once.
++  }
++  window.location.href = "/auth/login";
++};
++
+ export const useAuth = (setUser: (user: User | null) => void) => {
+   useEffect(() => {
+-    // Check for token in URL params, which happens after GitHub login redirect.
++    // Capture the app-JWT handed back by /auth/callback as /?token=<JWT>.
+     const searchParams = new URLSearchParams(window.location.search);
+     const token = searchParams.get("token");
+     if (token) {
+@@ -15,29 +33,41 @@ export const useAuth = (setUser: (user: User | null) => void) => {
+     }
+ 
+     const storedToken = localStorage.getItem("token");
+-    if (storedToken) {
+-      try {
+-        const decodedToken: any = jwtDecode(storedToken);
+-        // Check if token is expired.
+-        if (decodedToken.exp * 1000 > Date.now()) {
+-          setUser({
+-            id: decodedToken.sub,
+-            subject: decodedToken.sub,
+-            login: decodedToken.login,
+-            email: decodedToken.email,
+-            avatarUrl: decodedToken.avatarUrl,
+-            name: decodedToken.name,
+-          });
+-        } else {
+-          // Token is expired, remove it.
+-          localStorage.removeItem("token");
+-          setUser(null);
++    if (!storedToken) {
++      // No session at all → start OIDC login so subsequent API calls are authed.
++      setUser(null);
++      redirectToLogin();
++      return;
++    }
++    try {
++      const decodedToken: any = jwtDecode(storedToken);
++      // Check if token is expired.
++      if (decodedToken.exp * 1000 > Date.now()) {
++        setUser({
++          id: decodedToken.sub,
++          subject: decodedToken.sub,
++          login: decodedToken.login,
++          email: decodedToken.email,
++          avatarUrl: decodedToken.avatarUrl,
++          name: decodedToken.name,
++        });
++        // Valid session — clear the redirect guard so a future expiry re-logs in.
++        try {
++          sessionStorage.removeItem(AUTH_REDIRECT_GUARD_KEY);
++        } catch {
++          /* noop */
+         }
+-      } catch (error) {
+-        console.error("Invalid token:", error);
++      } else {
++        // Token is expired → drop it and re-authenticate.
+         localStorage.removeItem("token");
+         setUser(null);
++        redirectToLogin();
+       }
++    } catch (error) {
++      console.error("Invalid token:", error);
++      localStorage.removeItem("token");
++      setUser(null);
++      redirectToLogin();
+     }
+   }, [setUser]);
+ };
+diff --git a/excalidraw-app/tests/useAuth.test.ts b/excalidraw-app/tests/useAuth.test.ts
+new file mode 100644
+index 00000000..6c4583fe
+--- /dev/null
++++ b/excalidraw-app/tests/useAuth.test.ts
+@@ -0,0 +1,74 @@
++import { renderHook } from "@testing-library/react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++import { useAuth } from "../hooks/useAuth";
++
++// Prove the app-JWT capture + auto-login behavior that makes /api/v2/kv authed:
++//  - valid token  → setUser(...), no redirect
++//  - ?token= in URL → captured into localStorage
++//  - no token      → setUser(null) + redirect to /auth/login (once-guarded)
++//  - expired token → cleared + setUser(null) + redirect
++// (Regression guard for the "empty library / 401 Authorization header required" bug.)
++
++vi.mock("jwt-decode", () => ({
++  jwtDecode: (t: string) => {
++    if (t === "expired") {
++      return { sub: "s", exp: 1 }; // far past
++    }
++    return {
++      sub: "9cdb55c", login: "terafin", email: "j@x", exp: Math.floor(Date.now() / 1000) + 3600,
++    };
++  },
++}));
++
++const setHref = vi.fn();
++
++beforeEach(() => {
++  localStorage.clear();
++  sessionStorage.clear();
++  setHref.mockClear();
++  // jsdom: intercept navigation
++  delete (window as any).location;
++  (window as any).location = { search: "", pathname: "/", href: "",
++    set href(v: string) { setHref(v); } } as any;
++  window.history.replaceState = vi.fn() as any;
++});
++
++describe("useAuth", () => {
++  it("sets the user and does NOT redirect when a valid token is stored", () => {
++    localStorage.setItem("token", "valid");
++    const setUser = vi.fn();
++    renderHook(() => useAuth(setUser));
++    expect(setUser).toHaveBeenCalledWith(expect.objectContaining({ subject: "9cdb55c" }));
++    expect(setHref).not.toHaveBeenCalled();
++  });
++
++  it("captures ?token= from the URL into localStorage", () => {
++    (window as any).location.search = "?token=valid";
++    const setUser = vi.fn();
++    renderHook(() => useAuth(setUser));
++    expect(localStorage.getItem("token")).toBe("valid");
++  });
++
++  it("redirects to /auth/login when there is no token", () => {
++    const setUser = vi.fn();
++    renderHook(() => useAuth(setUser));
++    expect(setUser).toHaveBeenCalledWith(null);
++    expect(setHref).toHaveBeenCalledWith("/auth/login");
++  });
++
++  it("clears an expired token and redirects to /auth/login", () => {
++    localStorage.setItem("token", "expired");
++    const setUser = vi.fn();
++    renderHook(() => useAuth(setUser));
++    expect(localStorage.getItem("token")).toBeNull();
++    expect(setHref).toHaveBeenCalledWith("/auth/login");
++  });
++
++  it("redirects at most once per session (loop guard)", () => {
++    const setUser = vi.fn();
++    renderHook(() => useAuth(setUser));
++    renderHook(() => useAuth(setUser));
++    expect(setHref).toHaveBeenCalledTimes(1);
++  });
++});
